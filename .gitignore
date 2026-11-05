@@ -1,0 +1,13 @@
+# Binaries
+/bin/
+/archguard
+
+# IDEs
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+*.swp
+*~
+
