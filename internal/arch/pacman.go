@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"io/fs"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -79,6 +81,11 @@ func GetPendingUpdates(ctx context.Context) ([]PackageUpdate, error) {
 		return nil, err
 	}
 
+	return parseCheckupdatesOutput(output), nil
+}
+
+// parseCheckupdatesOutput parses the stdout lines from checkupdates into structured PackageUpdate slice.
+func parseCheckupdatesOutput(output []byte) []PackageUpdate {
 	var updates []PackageUpdate
 	scanner := bufio.NewScanner(bytes.NewReader(output))
 	for scanner.Scan() {
@@ -98,7 +105,7 @@ func GetPendingUpdates(ctx context.Context) ([]PackageUpdate, error) {
 			})
 		}
 	}
-	return updates, nil
+	return updates
 }
 
 // GetOrphans lists unneeded dependency packages with their metadata.
@@ -123,20 +130,31 @@ func GetOrphans(ctx context.Context) ([]OrphanPackage, error) {
 		return []OrphanPackage{}, nil
 	}
 
-	// Batch query pacman -Qi for details
-	args := append([]string{"-Qi"}, orphanNames...)
-	infoCmd := exec.CommandContext(ctx, "pacman", args...)
-	infoOut, err := infoCmd.Output()
-	if err != nil {
-		// Fallback: just return names
-		var simple []OrphanPackage
-		for _, name := range orphanNames {
-			simple = append(simple, OrphanPackage{Name: name})
+	// Security fix: pass "--" to prevent flag injection if an orphan name starts with "-"
+	// Also batch into chunks of 100 to prevent exceeding ARG_MAX
+	const batchSize = 100
+	var allOrphans []OrphanPackage
+
+	for i := 0; i < len(orphanNames); i += batchSize {
+		end := i + batchSize
+		if end > len(orphanNames) {
+			end = len(orphanNames)
 		}
-		return simple, nil
+		chunk := orphanNames[i:end]
+
+		args := append([]string{"-Qi", "--"}, chunk...)
+		infoCmd := exec.CommandContext(ctx, "pacman", args...)
+		infoOut, err := infoCmd.Output()
+		if err != nil {
+			for _, name := range chunk {
+				allOrphans = append(allOrphans, OrphanPackage{Name: name})
+			}
+			continue
+		}
+		allOrphans = append(allOrphans, parsePacmanInfo(infoOut)...)
 	}
 
-	return parsePacmanInfo(infoOut), nil
+	return allOrphans, nil
 }
 
 func parsePacmanInfo(output []byte) []OrphanPackage {
@@ -193,11 +211,38 @@ func GetCacheSize(ctx context.Context) (string, error) {
 	return "0B", nil
 }
 
-// GetPacnewFiles finds unmerged .pacnew configuration files under /etc.
+// GetPacnewFiles searches for unmerged .pacnew configuration files under /etc up to 3 levels deep.
 func GetPacnewFiles() ([]string, error) {
-	matches, err := filepath.Glob("/etc/*.pacnew")
-	if err != nil {
-		return nil, err
-	}
-	return matches, nil
+	var pacnewFiles []string
+	const maxDepth = 3
+
+	err := filepath.WalkDir("/etc", func(path string, d fs.DirEntry, err error) error {
+		// Gracefully skip unreadable directories without failing the entire walk
+		if err != nil {
+			if os.IsPermission(err) {
+				return fs.SkipDir
+			}
+			return nil
+		}
+
+		// Calculate current depth relative to /etc
+		rel, err := filepath.Rel("/etc", path)
+		if err != nil {
+			return nil
+		}
+		depth := strings.Count(rel, string(filepath.Separator))
+		if depth > maxDepth {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+
+		if !d.IsDir() && strings.HasSuffix(d.Name(), ".pacnew") {
+			pacnewFiles = append(pacnewFiles, path)
+		}
+		return nil
+	})
+
+	return pacnewFiles, err
 }

@@ -50,8 +50,7 @@ var (
 	// Item list styles
 	SelectedItemStyle = lipgloss.NewStyle().
 				Bold(true).
-				Foreground(ArchCyan).
-				Background(lipgloss.Color("#21222C"))
+				Foreground(ArchCyan)
 
 	NormalItemStyle = lipgloss.NewStyle().
 			Foreground(White)
