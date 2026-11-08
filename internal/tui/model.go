@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/SulthanAndyno/archguard/internal/arch"
@@ -29,33 +28,43 @@ var tabNames = []string{
 	"4. System & Cache Audit",
 }
 
-// InitialDataMsg contains the result of the parallel scan on startup
-type InitialDataMsg struct {
-	News        []arch.NewsItem
+// LocalDataMsg holds fast, local pacman telemetry
+type LocalDataMsg struct {
 	Updates     []arch.PackageUpdate
 	Orphans     []arch.OrphanPackage
+	Installed   map[string]bool
 	CacheSize   string
 	PacnewFiles []string
 	Err         error
 }
 
+// NewsDataMsg holds asynchronous news feed results
+type NewsDataMsg struct {
+	News []arch.NewsItem
+	Err  error
+}
+
 type Model struct {
-	activeTab   tabIndex
-	width       int
-	height      int
-	loading     bool
-	spinner     spinner.Model
-	statusMsg   string
+	activeTab tabIndex
+	width     int
+	height    int
+
+	localLoading bool
+	newsLoading  bool
+	spinner      spinner.Model
+	statusMsg    string
 
 	newsCursor    int
 	updatesCursor int
 	orphansCursor int
 
-	news        []arch.NewsItem
-	updates     []arch.PackageUpdate
-	orphans     []arch.OrphanPackage
-	cacheSize   string
-	pacnewFiles []string
+	news          []arch.NewsItem
+	updates       []arch.PackageUpdate
+	orphans       []arch.OrphanPackage
+	installedPkgs map[string]bool
+	cacheSize     string
+	pacnewFiles   []string
+	newsErr       error
 }
 
 func NewModel() Model {
@@ -64,71 +73,55 @@ func NewModel() Model {
 	s.Style = lipgloss.NewStyle().Foreground(ArchCyan)
 
 	return Model{
-		activeTab: tabNews,
-		loading:   true,
-		spinner:   s,
-		statusMsg: "Scanning Arch Linux environment...",
+		activeTab:    tabNews,
+		localLoading: true,
+		newsLoading:  true,
+		spinner:      s,
+		statusMsg:    "Scanning Arch Linux environment...",
+		width:        92,
+		height:       24,
 	}
 }
 
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(
 		m.spinner.Tick,
-		fetchSystemDataCmd(),
+		fetchLocalDataCmd(),
+		fetchNewsCmd(),
 	)
 }
 
-func fetchSystemDataCmd() tea.Cmd {
+func fetchLocalDataCmd() tea.Cmd {
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		var wg sync.WaitGroup
-		msg := InitialDataMsg{}
+		updates, _ := arch.GetPendingUpdates(ctx)
+		orphans, _ := arch.GetOrphans(ctx)
+		installed, _ := arch.GetInstalledPackages(ctx)
+		cacheSize, _ := arch.GetCacheSize(ctx)
+		pacnewFiles, _ := arch.GetPacnewFiles()
 
-		var installedPkgs map[string]bool
-		var rawNews []arch.NewsItem
-		var newsErr error
-
-		wg.Add(4)
-
-		// 1. Fetch News
-		go func() {
-			defer wg.Done()
-			rawNews, newsErr = arch.FetchNews(ctx, 10)
-		}()
-
-		// 2. Fetch Installed Packages
-		go func() {
-			defer wg.Done()
-			installed, _ := arch.GetInstalledPackages(ctx)
-			installedPkgs = installed
-		}()
-
-		// 3. Fetch Updates
-		go func() {
-			defer wg.Done()
-			updates, _ := arch.GetPendingUpdates(ctx)
-			msg.Updates = updates
-		}()
-
-		// 4. Fetch Orphans & Cache & Pacnew
-		go func() {
-			defer wg.Done()
-			msg.Orphans, _ = arch.GetOrphans(ctx)
-			msg.CacheSize, _ = arch.GetCacheSize(ctx)
-			msg.PacnewFiles, _ = arch.GetPacnewFiles()
-		}()
-
-		wg.Wait()
-
-		if newsErr == nil && installedPkgs != nil {
-			msg.News = arch.CheckInterventions(rawNews, installedPkgs)
-		} else {
-			msg.News = rawNews
+		return LocalDataMsg{
+			Updates:     updates,
+			Orphans:     orphans,
+			Installed:   installed,
+			CacheSize:   cacheSize,
+			PacnewFiles: pacnewFiles,
 		}
+	}
+}
 
-		return msg
+func fetchNewsCmd() tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+
+		items, err := arch.FetchNews(ctx, 10)
+		return NewsDataMsg{
+			News: items,
+			Err:  err,
+		}
 	}
 }
 
@@ -140,21 +133,38 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case spinner.TickMsg:
-		if m.loading {
+		if m.localLoading || m.newsLoading {
 			var cmd tea.Cmd
 			m.spinner, cmd = m.spinner.Update(msg)
 			return m, cmd
 		}
 
-	case InitialDataMsg:
-		m.loading = false
-		m.news = msg.News
+	case LocalDataMsg:
+		m.localLoading = false
 		m.updates = msg.Updates
 		m.orphans = msg.Orphans
+		m.installedPkgs = msg.Installed
 		m.cacheSize = msg.CacheSize
 		m.pacnewFiles = msg.PacnewFiles
-		m.statusMsg = fmt.Sprintf("Ready | %d News, %d Updates, %d Orphans",
-			len(m.news), len(m.updates), len(m.orphans))
+
+		// If news was already loaded, correlate interventions
+		if len(m.news) > 0 && m.installedPkgs != nil {
+			m.news = arch.CheckInterventions(m.news, m.installedPkgs)
+		}
+		m.updateStatus()
+		return m, nil
+
+	case NewsDataMsg:
+		m.newsLoading = false
+		m.newsErr = msg.Err
+		if msg.Err == nil {
+			if m.installedPkgs != nil {
+				m.news = arch.CheckInterventions(msg.News, m.installedPkgs)
+			} else {
+				m.news = msg.News
+			}
+		}
+		m.updateStatus()
 		return m, nil
 
 	case tea.KeyMsg:
@@ -186,7 +196,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.activeTab = tabAudit
 			return m, nil
 
-		// Navigation within tabs
+		// Navigation
 		case "up", "k":
 			switch m.activeTab {
 			case tabNews:
@@ -225,22 +235,66 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case " ":
 			if m.activeTab == tabOrphans && len(m.orphans) > 0 {
 				m.orphans[m.orphansCursor].Selected = !m.orphans[m.orphansCursor].Selected
+				m.updateStatus()
+				return m, nil
+			}
+
+		// Select all / deselect all in Orphans
+		case "a":
+			if m.activeTab == tabOrphans && len(m.orphans) > 0 {
+				allSelected := true
+				for _, o := range m.orphans {
+					if !o.Selected {
+						allSelected = false
+						break
+					}
+				}
+				for i := range m.orphans {
+					m.orphans[i].Selected = !allSelected
+				}
+				m.updateStatus()
 				return m, nil
 			}
 
 		case "r":
-			// Refresh data
-			m.loading = true
-			m.statusMsg = "Refreshing data..."
-			return m, tea.Batch(m.spinner.Tick, fetchSystemDataCmd())
+			// Refresh data asynchronously
+			m.localLoading = true
+			m.newsLoading = true
+			m.statusMsg = "Refreshing system data..."
+			return m, tea.Batch(
+				m.spinner.Tick,
+				fetchLocalDataCmd(),
+				fetchNewsCmd(),
+			)
 		}
 	}
 
 	return m, nil
 }
 
+func (m *Model) updateStatus() {
+	selectedOrphans := 0
+	for _, o := range m.orphans {
+		if o.Selected {
+			selectedOrphans++
+		}
+	}
+
+	newsCount := len(m.news)
+	if m.newsLoading {
+		m.statusMsg = fmt.Sprintf("Ready (Local) | %d Updates, %d Orphans (%d selected) | Loading News...",
+			len(m.updates), len(m.orphans), selectedOrphans)
+	} else if m.newsErr != nil {
+		m.statusMsg = fmt.Sprintf("Ready | %d Updates, %d Orphans (%d selected) | News Offline",
+			len(m.updates), len(m.orphans), selectedOrphans)
+	} else {
+		m.statusMsg = fmt.Sprintf("Ready | %d News, %d Updates, %d Orphans (%d selected)",
+			newsCount, len(m.updates), len(m.orphans), selectedOrphans)
+	}
+}
+
 func (m Model) View() string {
-	if m.loading {
+	if m.localLoading {
 		return fmt.Sprintf("\n\n   %s  %s\n\n", m.spinner.View(), m.statusMsg)
 	}
 
@@ -253,10 +307,14 @@ func (m Model) View() string {
 	// 2. Tabs
 	var renderedTabs []string
 	for i, name := range tabNames {
+		tabLabel := name
+		if i == 0 && m.newsLoading {
+			tabLabel += " " + m.spinner.View()
+		}
 		if tabIndex(i) == m.activeTab {
-			renderedTabs = append(renderedTabs, ActiveTabStyle.Render(name))
+			renderedTabs = append(renderedTabs, ActiveTabStyle.Render(tabLabel))
 		} else {
-			renderedTabs = append(renderedTabs, InactiveTabStyle.Render(name))
+			renderedTabs = append(renderedTabs, InactiveTabStyle.Render(tabLabel))
 		}
 	}
 	b.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, renderedTabs...) + "\n\n")
@@ -274,16 +332,37 @@ func (m Model) View() string {
 		content = m.renderAuditTab()
 	}
 
-	b.WriteString(PanelStyle.Width(92).Render(content))
+	// Dynamic panel width based on window size
+	panelWidth := m.width - 4
+	if panelWidth < 65 {
+		panelWidth = 65
+	} else if panelWidth > 115 {
+		panelWidth = 115
+	}
+
+	b.WriteString(PanelStyle.Width(panelWidth).Render(content))
 
 	// 4. Footer & Keybindings Help
-	help := HelpStyle.Render("[Tab/1-4] Switch Tab • [j/k/↑/↓] Navigate • [Space] Toggle • [r] Refresh • [q] Quit")
+	var helpText string
+	if m.activeTab == tabOrphans {
+		helpText = "[Tab/1-4] Switch • [j/k] Navigate • [Space] Toggle • [a] Toggle All • [r] Refresh • [q] Quit"
+	} else {
+		helpText = "[Tab/1-4] Switch Tab • [j/k/↑/↓] Navigate • [r] Refresh • [q] Quit"
+	}
+
+	help := HelpStyle.Render(helpText + "   (" + m.statusMsg + ")")
 	b.WriteString("\n" + help + "\n")
 
 	return b.String()
 }
 
 func (m Model) renderNewsTab() string {
+	if m.newsLoading {
+		return fmt.Sprintf("\n  %s Fetching latest official Arch Linux announcements...", m.spinner.View())
+	}
+	if m.newsErr != nil {
+		return lipgloss.NewStyle().Foreground(WarningRed).Render(fmt.Sprintf("Failed to fetch RSS news: %v (Press 'r' to retry)", m.newsErr))
+	}
 	if len(m.news) == 0 {
 		return "No news items available."
 	}
@@ -307,16 +386,16 @@ func (m Model) renderNewsTab() string {
 		}
 
 		dateStr := item.PubDate.Format("2006-01-02")
-		line := fmt.Sprintf("%s%s  (%s)\n", cursor, itemTitle, lipgloss.NewStyle().Foreground(MutedGray).Render(dateStr))
+		line := fmt.Sprintf("%s%s  (%s)", cursor, itemTitle, lipgloss.NewStyle().Foreground(MutedGray).Render(dateStr))
 
 		if i == m.newsCursor {
-			b.WriteString(SelectedItemStyle.Render(line))
+			b.WriteString(SelectedItemStyle.Render(line) + "\n")
 			if item.Snippet != "" {
-				snippetBox := lipgloss.NewStyle().Foreground(White).PaddingLeft(4).Render(item.Snippet) + "\n"
-				b.WriteString(snippetBox)
+				snippetBox := lipgloss.NewStyle().Foreground(White).PaddingLeft(4).Render(item.Snippet)
+				b.WriteString(snippetBox + "\n")
 			}
 		} else {
-			b.WriteString(NormalItemStyle.Render(line))
+			b.WriteString(NormalItemStyle.Render(line) + "\n")
 		}
 	}
 
@@ -329,10 +408,34 @@ func (m Model) renderUpdatesTab() string {
 	}
 
 	var b strings.Builder
-	header := fmt.Sprintf("Pending Packages: %d\n\n", len(m.updates))
-	b.WriteString(lipgloss.NewStyle().Bold(true).Foreground(ArchCyan).Render(header))
+	header := fmt.Sprintf("Pending Packages: %d", len(m.updates))
+	b.WriteString(lipgloss.NewStyle().Bold(true).Foreground(ArchCyan).Render(header) + "\n\n")
 
-	for i, u := range m.updates {
+	// Calculate maximum package name width for uniform column alignment
+	maxNameLen := 26
+	for _, u := range m.updates {
+		if len(u.Name) > maxNameLen && len(u.Name) <= 34 {
+			maxNameLen = len(u.Name)
+		}
+	}
+
+	// Simple scroll window if list is very large
+	maxVisible := 14
+	startIdx := 0
+	if m.updatesCursor >= maxVisible {
+		startIdx = m.updatesCursor - maxVisible + 1
+	}
+	endIdx := startIdx + maxVisible
+	if endIdx > len(m.updates) {
+		endIdx = len(m.updates)
+	}
+
+	if startIdx > 0 {
+		b.WriteString(lipgloss.NewStyle().Foreground(MutedGray).Render(fmt.Sprintf("  ▲ ... %d more packages above ...", startIdx)) + "\n")
+	}
+
+	for i := startIdx; i < endIdx; i++ {
+		u := m.updates[i]
 		cursor := "  "
 		if i == m.updatesCursor {
 			cursor = "▶ "
@@ -343,14 +446,18 @@ func (m Model) renderUpdatesTab() string {
 			badge = lipgloss.NewStyle().Background(WarningRed).Foreground(White).Bold(true).Render(" CRITICAL ") + " "
 		}
 
-		line := fmt.Sprintf("%s%s%-24s %s -> %s\n", cursor, badge, u.Name, u.OldVersion, lipgloss.NewStyle().Foreground(SuccessGreen).Render(u.NewVersion))
+		line := fmt.Sprintf("%s%s%-*s  %-14s -> %s", cursor, badge, maxNameLen, u.Name, u.OldVersion, lipgloss.NewStyle().Foreground(SuccessGreen).Render(u.NewVersion))
 		if i == m.updatesCursor {
-			b.WriteString(SelectedItemStyle.Render(line))
+			b.WriteString(SelectedItemStyle.Render(line) + "\n")
 		} else if u.IsCritical {
-			b.WriteString(CriticalItemStyle.Render(line))
+			b.WriteString(CriticalItemStyle.Render(line) + "\n")
 		} else {
-			b.WriteString(NormalItemStyle.Render(line))
+			b.WriteString(NormalItemStyle.Render(line) + "\n")
 		}
+	}
+
+	if endIdx < len(m.updates) {
+		b.WriteString(lipgloss.NewStyle().Foreground(MutedGray).Render(fmt.Sprintf("  ▼ ... %d more packages below ...", len(m.updates)-endIdx)) + "\n")
 	}
 
 	return b.String()
@@ -362,10 +469,47 @@ func (m Model) renderOrphansTab() string {
 	}
 
 	var b strings.Builder
-	header := fmt.Sprintf("Orphan Packages Detected: %d (Unneeded Dependencies)\nPress [Space] to toggle, remove with: sudo pacman -Rns <selected>\n\n", len(m.orphans))
-	b.WriteString(lipgloss.NewStyle().Bold(true).Foreground(ArchCyan).Render(header))
+	var selectedList []string
+	for _, o := range m.orphans {
+		if o.Selected {
+			selectedList = append(selectedList, o.Name)
+		}
+	}
 
-	for i, o := range m.orphans {
+	header := fmt.Sprintf("Orphan Packages Detected: %d (Unneeded Dependencies)", len(m.orphans))
+	b.WriteString(lipgloss.NewStyle().Bold(true).Foreground(ArchCyan).Render(header) + "\n")
+	b.WriteString(lipgloss.NewStyle().Foreground(MutedGray).Render("Press [Space] to toggle, [a] to toggle all") + "\n\n")
+
+	if len(selectedList) > 0 {
+		cmdPreview := fmt.Sprintf("Suggested Removal: sudo pacman -Rns %s", strings.Join(selectedList, " "))
+		b.WriteString(lipgloss.NewStyle().Foreground(Highlight).Render(cmdPreview) + "\n\n")
+	} else {
+		b.WriteString(lipgloss.NewStyle().Foreground(MutedGray).Render("Select packages below to generate removal command.") + "\n\n")
+	}
+
+	maxOrphanLen := 22
+	for _, o := range m.orphans {
+		if len(o.Name) > maxOrphanLen && len(o.Name) <= 30 {
+			maxOrphanLen = len(o.Name)
+		}
+	}
+
+	maxVisible := 14
+	startIdx := 0
+	if m.orphansCursor >= maxVisible {
+		startIdx = m.orphansCursor - maxVisible + 1
+	}
+	endIdx := startIdx + maxVisible
+	if endIdx > len(m.orphans) {
+		endIdx = len(m.orphans)
+	}
+
+	if startIdx > 0 {
+		b.WriteString(lipgloss.NewStyle().Foreground(MutedGray).Render(fmt.Sprintf("  ▲ ... %d more orphans above ...", startIdx)) + "\n")
+	}
+
+	for i := startIdx; i < endIdx; i++ {
+		o := m.orphans[i]
 		cursor := "  "
 		if i == m.orphansCursor {
 			cursor = "▶ "
@@ -381,13 +525,17 @@ func (m Model) renderOrphansTab() string {
 			sizeStr = fmt.Sprintf("(%s)", o.Size)
 		}
 
-		line := fmt.Sprintf("%s%s%-22s %-12s %s\n", cursor, checkbox, o.Name, lipgloss.NewStyle().Foreground(Highlight).Render(sizeStr), lipgloss.NewStyle().Foreground(MutedGray).Render(o.Description))
+		line := fmt.Sprintf("%s%s%-*s %-12s %s", cursor, checkbox, maxOrphanLen, o.Name, lipgloss.NewStyle().Foreground(Highlight).Render(sizeStr), lipgloss.NewStyle().Foreground(MutedGray).Render(o.Description))
 
 		if i == m.orphansCursor {
-			b.WriteString(SelectedItemStyle.Render(line))
+			b.WriteString(SelectedItemStyle.Render(line) + "\n")
 		} else {
-			b.WriteString(NormalItemStyle.Render(line))
+			b.WriteString(NormalItemStyle.Render(line) + "\n")
 		}
+	}
+
+	if endIdx < len(m.orphans) {
+		b.WriteString(lipgloss.NewStyle().Foreground(MutedGray).Render(fmt.Sprintf("  ▼ ... %d more orphans below ...", len(m.orphans)-endIdx)) + "\n")
 	}
 
 	return b.String()
