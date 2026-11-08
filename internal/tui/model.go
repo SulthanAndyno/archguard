@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -28,6 +29,15 @@ var tabNames = []string{
 	"4. System & Cache Audit",
 }
 
+type confirmAction int
+
+const (
+	confirmNone confirmAction = iota
+	confirmDeleteOrphans
+	confirmCleanCache
+	confirmUpgradeSystem
+)
+
 // LocalDataMsg holds fast, local pacman telemetry
 type LocalDataMsg struct {
 	Updates     []arch.PackageUpdate
@@ -44,10 +54,17 @@ type NewsDataMsg struct {
 	Err  error
 }
 
+// actionFinishedMsg is returned after an interactive tea.ExecProcess completes
+type actionFinishedMsg struct {
+	action string
+	err    error
+}
+
 type Model struct {
-	activeTab tabIndex
-	width     int
-	height    int
+	activeTab  tabIndex
+	confirming confirmAction
+	width      int
+	height     int
 
 	localLoading bool
 	newsLoading  bool
@@ -74,6 +91,7 @@ func NewModel() Model {
 
 	return Model{
 		activeTab:    tabNews,
+		confirming:   confirmNone,
 		localLoading: true,
 		newsLoading:  true,
 		spinner:      s,
@@ -167,7 +185,63 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.updateStatus()
 		return m, nil
 
+	case actionFinishedMsg:
+		if msg.err != nil {
+			m.statusMsg = fmt.Sprintf("Action failed or cancelled: %v", msg.err)
+		} else {
+			m.statusMsg = fmt.Sprintf("Action '%s' completed successfully!", msg.action)
+		}
+		// Refresh local data immediately
+		m.localLoading = true
+		return m, tea.Batch(m.spinner.Tick, fetchLocalDataCmd())
+
 	case tea.KeyMsg:
+		// Handle Active Confirmation Dialog
+		if m.confirming != confirmNone {
+			switch msg.String() {
+			case "y", "Y", "enter":
+				action := m.confirming
+				m.confirming = confirmNone
+
+				switch action {
+				case confirmDeleteOrphans:
+					var selected []string
+					for _, o := range m.orphans {
+						if o.Selected {
+							selected = append(selected, o.Name)
+						}
+					}
+					if len(selected) == 0 {
+						m.statusMsg = "No packages selected."
+						return m, nil
+					}
+					c := exec.Command("sudo", append([]string{"pacman", "-Rns", "--"}, selected...)...)
+					return m, tea.ExecProcess(c, func(err error) tea.Msg {
+						return actionFinishedMsg{action: "remove_orphans", err: err}
+					})
+
+				case confirmCleanCache:
+					c := exec.Command("sudo", "paccache", "-rk2")
+					return m, tea.ExecProcess(c, func(err error) tea.Msg {
+						return actionFinishedMsg{action: "clean_cache", err: err}
+					})
+
+				case confirmUpgradeSystem:
+					c := exec.Command("sudo", "pacman", "-Syu")
+					return m, tea.ExecProcess(c, func(err error) tea.Msg {
+						return actionFinishedMsg{action: "system_upgrade", err: err}
+					})
+				}
+
+			case "n", "N", "esc":
+				m.confirming = confirmNone
+				m.statusMsg = "Action cancelled."
+				return m, nil
+			}
+			return m, nil
+		}
+
+		// Standard Keybindings
 		switch msg.String() {
 		case "ctrl+c", "q":
 			return m, tea.Quit
@@ -253,6 +327,52 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.orphans[i].Selected = !allSelected
 				}
 				m.updateStatus()
+				return m, nil
+			}
+
+		// Delete selected orphans
+		case "d":
+			if m.activeTab == tabOrphans {
+				count := 0
+				for _, o := range m.orphans {
+					if o.Selected {
+						count++
+					}
+				}
+				if count == 0 {
+					m.statusMsg = "No orphans selected. Press [Space] or [a] first."
+				} else {
+					m.confirming = confirmDeleteOrphans
+				}
+				return m, nil
+			}
+
+		// Clean cache
+		case "c":
+			if m.activeTab == tabAudit {
+				m.confirming = confirmCleanCache
+				return m, nil
+			}
+
+		// Safe system upgrade
+		case "u":
+			if m.activeTab == tabUpdates {
+				if len(m.updates) == 0 {
+					m.statusMsg = "No pending updates available."
+				} else {
+					m.confirming = confirmUpgradeSystem
+				}
+				return m, nil
+			}
+
+		// Open news link in browser
+		case "o", "enter":
+			if m.activeTab == tabNews && len(m.news) > 0 && m.newsCursor < len(m.news) {
+				link := m.news[m.newsCursor].Link
+				if link != "" {
+					_ = exec.Command("xdg-open", link).Start()
+					m.statusMsg = "Opening advisory link in default browser..."
+				}
 				return m, nil
 			}
 
@@ -342,12 +462,41 @@ func (m Model) View() string {
 
 	b.WriteString(PanelStyle.Width(panelWidth).Render(content))
 
-	// 4. Footer & Keybindings Help
+	// 4. Confirmation Banner if pending
+	if m.confirming != confirmNone {
+		var confirmText string
+		switch m.confirming {
+		case confirmDeleteOrphans:
+			count := 0
+			for _, o := range m.orphans {
+				if o.Selected {
+					count++
+				}
+			}
+			confirmText = fmt.Sprintf("CONFIRM REMOVAL: Run 'sudo pacman -Rns' to delete %d package(s)? [y] Confirm • [n/Esc] Cancel", count)
+		case confirmCleanCache:
+			confirmText = "CONFIRM CACHE TRIM: Run 'sudo paccache -rk2' to clean old packages? [y] Confirm • [n/Esc] Cancel"
+		case confirmUpgradeSystem:
+			confirmText = fmt.Sprintf("CONFIRM UPGRADE: Run 'sudo pacman -Syu' for %d pending package(s)? [y] Confirm • [n/Esc] Cancel", len(m.updates))
+		}
+		b.WriteString("\n" + WarningBoxStyle.Render(" "+confirmText+" "))
+	}
+
+	// 5. Footer & Keybindings Help
 	var helpText string
-	if m.activeTab == tabOrphans {
-		helpText = "[Tab/1-4] Switch • [j/k] Navigate • [Space] Toggle • [a] Toggle All • [r] Refresh • [q] Quit"
+	if m.confirming != confirmNone {
+		helpText = "[y / Enter] Proceed with Sudo • [n / Esc] Cancel"
 	} else {
-		helpText = "[Tab/1-4] Switch Tab • [j/k/↑/↓] Navigate • [r] Refresh • [q] Quit"
+		switch m.activeTab {
+		case tabNews:
+			helpText = "[Tab/1-4] Switch • [j/k] Navigate • [o/Enter] Open in Browser • [r] Refresh • [q] Quit"
+		case tabUpdates:
+			helpText = "[Tab/1-4] Switch • [j/k] Navigate • [u] Safe Upgrade (pacman -Syu) • [r] Refresh • [q] Quit"
+		case tabOrphans:
+			helpText = "[Tab/1-4] Switch • [Space] Toggle • [a] All • [d] Delete Selected • [r] Refresh • [q] Quit"
+		case tabAudit:
+			helpText = "[Tab/1-4] Switch • [j/k] Navigate • [c] Clean Cache (paccache -rk2) • [r] Refresh • [q] Quit"
+		}
 	}
 
 	help := HelpStyle.Render(helpText + "   (" + m.statusMsg + ")")
@@ -478,7 +627,7 @@ func (m Model) renderOrphansTab() string {
 
 	header := fmt.Sprintf("Orphan Packages Detected: %d (Unneeded Dependencies)", len(m.orphans))
 	b.WriteString(lipgloss.NewStyle().Bold(true).Foreground(ArchCyan).Render(header) + "\n")
-	b.WriteString(lipgloss.NewStyle().Foreground(MutedGray).Render("Press [Space] to toggle, [a] to toggle all") + "\n\n")
+	b.WriteString(lipgloss.NewStyle().Foreground(MutedGray).Render("Press [Space] to toggle, [a] to toggle all, [d] to delete selected") + "\n\n")
 
 	if len(selectedList) > 0 {
 		cmdPreview := fmt.Sprintf("Suggested Removal: sudo pacman -Rns %s", strings.Join(selectedList, " "))
@@ -548,7 +697,7 @@ func (m Model) renderAuditTab() string {
 	// Cache info
 	b.WriteString(fmt.Sprintf("• Pacman Cache Size (/var/cache/pacman/pkg): %s\n",
 		lipgloss.NewStyle().Bold(true).Foreground(Highlight).Render(m.cacheSize)))
-	b.WriteString("  Tip: Clean old cache versions using `sudo paccache -rk2`\n\n")
+	b.WriteString("  Shortcut: Press [c] to run `sudo paccache -rk2` directly\n\n")
 
 	// Pacnew files
 	b.WriteString(fmt.Sprintf("• Unmerged .pacnew files in /etc: %d found\n", len(m.pacnewFiles)))
@@ -563,10 +712,10 @@ func (m Model) renderAuditTab() string {
 
 	// Recommended safe update flow
 	b.WriteString(lipgloss.NewStyle().Bold(true).Foreground(ArchCyan).Render("Recommended Safe Upgrade Procedure:") + "\n")
-	b.WriteString("  1. Review any 'MANUAL ACTION REQUIRED' in Tab 1 before upgrading\n")
-	b.WriteString("  2. Run `sudo pacman -Syu` to apply pending updates\n")
-	b.WriteString("  3. Check Tab 3 to trim any orphaned dependencies (`sudo pacman -Rns ...`)\n")
-	b.WriteString("  4. If kernel or systemd was upgraded, reboot when convenient\n")
+	b.WriteString("  1. Review any 'MANUAL ACTION REQUIRED' in Tab 1 before upgrading ([o] opens link)\n")
+	b.WriteString("  2. In Tab 2, press [u] to apply pending updates (`sudo pacman -Syu`)\n")
+	b.WriteString("  3. In Tab 3, select unneeded orphans and press [d] to purge\n")
+	b.WriteString("  4. In Tab 4, press [c] to trim old pacman cache\n")
 
 	return b.String()
 }
