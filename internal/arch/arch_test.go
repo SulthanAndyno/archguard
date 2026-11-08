@@ -21,22 +21,59 @@ func TestCheckInterventions(t *testing.T) {
 			PubDate: time.Now(),
 		},
 		{
-			Title:   "Normal maintenance update",
+			Title:   "Update to ca-certificates-mozilla >= 3.131.1-1 to prevent MITM",
+			PubDate: time.Now(),
+		},
+		{
+			Title:   "Standard kernel release notes",
 			PubDate: time.Now(),
 		},
 	}
 
 	installed := map[string]bool{
-		"glibc":   true,
-		"firefox": true,
+		"glibc":                  true,
+		"ca-certificates-mozilla": true,
+		"ca":                     true,
+		"firefox":                true,
 	}
 
 	result := CheckInterventions(items, installed)
+
 	if result[0].MatchedPackage != "glibc" {
 		t.Errorf("Expected matched package 'glibc', got %q", result[0].MatchedPackage)
 	}
-	if result[1].MatchedPackage != "" {
-		t.Errorf("Expected no matched package, got %q", result[1].MatchedPackage)
+
+	// Should match ca-certificates-mozilla, NOT just 'ca'
+	if result[1].MatchedPackage != "ca-certificates-mozilla" {
+		t.Errorf("Expected 'ca-certificates-mozilla' (longest match), got %q", result[1].MatchedPackage)
+	}
+
+	if result[2].MatchedPackage != "" {
+		t.Errorf("Expected no match for item 2, got %q", result[2].MatchedPackage)
+	}
+}
+
+func TestParseCheckupdatesOutput(t *testing.T) {
+	sampleOutput := []byte(`
+linux 6.12.1-arch1 -> 6.12.2-arch1
+firefox 132.0.1-1 -> 132.0.2-1
+nvidia 565.77-1 -> 565.77-2
+invalid_line_without_arrow
+`)
+
+	updates := parseCheckupdatesOutput(sampleOutput)
+	if len(updates) != 3 {
+		t.Fatalf("Expected 3 valid updates, got %d", len(updates))
+	}
+
+	if updates[0].Name != "linux" || !updates[0].IsCritical {
+		t.Errorf("Expected critical package 'linux', got %+v", updates[0])
+	}
+	if updates[1].Name != "firefox" || updates[1].IsCritical {
+		t.Errorf("Expected non-critical package 'firefox', got %+v", updates[1])
+	}
+	if updates[2].Name != "nvidia" || !updates[2].IsCritical {
+		t.Errorf("Expected critical package 'nvidia', got %+v", updates[2])
 	}
 }
 

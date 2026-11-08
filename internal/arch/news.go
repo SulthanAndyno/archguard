@@ -2,11 +2,15 @@ package arch
 
 import (
 	"context"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/mmcdole/gofeed"
 )
+
+// wordRegex matches individual words/package identifiers, ignoring punctuation
+var wordRegex = regexp.MustCompile(`[a-zA-Z0-9][a-zA-Z0-9_\.\-]+`)
 
 // NewsItem represents an official Arch Linux news announcement.
 type NewsItem struct {
@@ -67,20 +71,25 @@ func FetchNews(ctx context.Context, limit int) ([]NewsItem, error) {
 }
 
 // CheckInterventions correlates news items with the list of locally installed packages.
+// Uses word boundary tokenization to eliminate false positives and non-deterministic map order bugs.
 func CheckInterventions(items []NewsItem, installedPackages map[string]bool) []NewsItem {
 	for i := range items {
 		titleLower := strings.ToLower(items[i].Title)
-		// Try matching common package name patterns mentioned in the title
-		for pkg := range installedPackages {
-			if len(pkg) < 3 {
-				continue // skip too-short names to avoid false positive substring matches
+		tokens := wordRegex.FindAllString(titleLower, -1)
+
+		var bestMatch string
+		for _, token := range tokens {
+			if len(token) < 2 {
+				continue
 			}
-			// Check word boundaries roughly
-			if strings.Contains(titleLower, pkg) {
-				items[i].MatchedPackage = pkg
-				break
+			if installedPackages[token] {
+				// Prioritize the longest matching package name (e.g. ca-certificates-mozilla over ca)
+				if len(token) > len(bestMatch) {
+					bestMatch = token
+				}
 			}
 		}
+		items[i].MatchedPackage = bestMatch
 	}
 	return items
 }
